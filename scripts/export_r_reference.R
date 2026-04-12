@@ -16,7 +16,7 @@ dds <- DESeqDataSet(airway, design = ~ dex)
 dds$dex <- relevel(dds$dex, ref = "untrt")
 
 # Output directory
-outdir <- "rust_deseq2/tests/reference_data"
+outdir <- "tests/reference_data"
 dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
 # 1. Export raw counts (genes x samples)

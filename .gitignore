@@ -1,0 +1,6 @@
+.worktrees/
+.codex
+.codex/
+.omx/
+.tmp_r_lib/
+DESeq2/

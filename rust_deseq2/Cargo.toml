@@ -1,0 +1,20 @@
+[package]
+name = "deseq2-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust reimplementation of DESeq2 core differential expression analysis"
+
+[[bin]]
+name = "deseq2-rs"
+path = "src/bin/main.rs"
+
+[dependencies]
+faer = "0.20"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+statrs = "0.18"
+
+[dev-dependencies]
+approx = "0.5"
+tempfile = "3"

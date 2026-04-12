@@ -486,6 +486,58 @@ pub fn fit_dispersion(
     }
 }
 
+/// Grid search for dispersion (fallback for non-converged genes).
+/// Matches DESeq2.cpp fitDispGrid: evaluate log_posterior on coarse grid,
+/// refine around maximum on finer grid.
+pub fn fit_dispersion_grid(
+    y: &[f64],
+    mu: &[f64],
+    x: &Mat<f64>,
+    n_samples: usize,
+    prior_mean: f64,
+    prior_var: f64,
+    use_prior: bool,
+    use_cr: bool,
+) -> f64 {
+    // Match R's fitDispGridWrapper: 15 points from log(1e-9) to log(max(10, ncol))
+    let n_grid = 15;
+    let min_la = (1e-8 / 10.0_f64).ln(); // log(1e-9) ≈ -20.7
+    let max_la = (10.0f64.max(n_samples as f64)).ln(); // log(10) ≈ 2.3
+    let grid: Vec<f64> = (0..n_grid)
+        .map(|i| min_la + (max_la - min_la) * i as f64 / (n_grid - 1) as f64)
+        .collect();
+
+    // Coarse grid
+    let mut best_lp = f64::NEG_INFINITY;
+    let mut best_idx = 0;
+    for (i, &la) in grid.iter().enumerate() {
+        let lp = log_posterior(la, y, mu, x, prior_mean, prior_var, use_prior, use_cr);
+        if lp > best_lp {
+            best_lp = lp;
+            best_idx = i;
+        }
+    }
+
+    // Fine grid around best
+    let delta = if n_grid > 1 { grid[1] - grid[0] } else { 1.0 };
+    let center = grid[best_idx];
+    let fine_grid: Vec<f64> = (0..n_grid)
+        .map(|i| center - delta + (2.0 * delta * i as f64 / (n_grid - 1) as f64))
+        .collect();
+
+    let mut best_la = center;
+    best_lp = f64::NEG_INFINITY;
+    for &la in &fine_grid {
+        let lp = log_posterior(la, y, mu, x, prior_mean, prior_var, use_prior, use_cr);
+        if lp > best_lp {
+            best_lp = lp;
+            best_la = la;
+        }
+    }
+
+    best_la
+}
+
 // ---------------------------------------------------------------------------
 // Rough dispersion estimate (method of moments)
 // ---------------------------------------------------------------------------
@@ -599,21 +651,167 @@ pub fn linear_model_mu(normalized_counts: &Mat<f64>, design: &Mat<f64>) -> Mat<f
 // Orchestrator: estimate_dispersions_gene
 // ---------------------------------------------------------------------------
 
+/// Moments-based dispersion estimate (R's momentsDispEstimate).
+/// momentsDisp = (rowVar(norm) - mean(1/sf) * rowMean(norm)) / rowMean(norm)^2
+pub fn moments_disp_estimate(
+    normalized_counts: &Mat<f64>,
+    size_factors: &[f64],
+) -> Vec<f64> {
+    let n_genes = normalized_counts.nrows();
+    let n_samples = normalized_counts.ncols();
+    let xim: f64 = size_factors.iter().map(|&s| 1.0 / s).sum::<f64>() / n_samples as f64;
+
+    (0..n_genes)
+        .map(|i| {
+            let mean: f64 = (0..n_samples).map(|j| normalized_counts[(i, j)]).sum::<f64>()
+                / n_samples as f64;
+            if mean < 1e-8 {
+                return 0.0;
+            }
+            let var: f64 = (0..n_samples)
+                .map(|j| (normalized_counts[(i, j)] - mean).powi(2))
+                .sum::<f64>()
+                / (n_samples - 1) as f64;
+            ((var - xim * mean) / (mean * mean)).max(0.0)
+        })
+        .collect()
+}
+
+/// Compute mu from NB GLM fit (unused in current pipeline, retained for future use).
+#[allow(dead_code)]
+fn compute_mu_from_glm(
+    counts: &Mat<f64>,
+    size_factors: &[f64],
+    design_matrix: &Mat<f64>,
+    dispersions: &[f64],
+    minmu: f64,
+) -> Mat<f64> {
+    let n_genes = counts.nrows();
+    let n_samples = counts.ncols();
+    let n_params = design_matrix.ncols();
+    let tol = 1e-6;
+    let maxit = 100;
+    let large = 30.0;
+    let lambda = 1e-6;
+
+    // Initialize betas via normal equations on log(normalized + 0.1)
+    // Build (X'X)^{-1} X'
+    let p = n_params;
+    let mut xtx = vec![vec![0.0; p]; p];
+    for i in 0..p {
+        for j in 0..p {
+            for k in 0..n_samples {
+                xtx[i][j] += design_matrix[(k, i)] * design_matrix[(k, j)];
+            }
+        }
+    }
+    let xtx_inv = matrix_inverse(&xtx);
+
+    let mut mu = Mat::zeros(n_genes, n_samples);
+
+    for gene in 0..n_genes {
+        let alpha = dispersions[gene];
+        if alpha.is_nan() || alpha <= 0.0 {
+            for j in 0..n_samples {
+                mu[(gene, j)] = (counts[(gene, j)] / size_factors[j]).max(minmu) * size_factors[j];
+            }
+            continue;
+        }
+
+        // Init beta from log(normalized + 0.1)
+        let mut xty = vec![0.0; p];
+        for k in 0..p {
+            for j in 0..n_samples {
+                xty[k] += design_matrix[(j, k)] * (counts[(gene, j)] / size_factors[j] + 0.1).ln();
+            }
+        }
+        let mut beta = vec![0.0; p];
+        for i in 0..p {
+            for j in 0..p {
+                beta[i] += xtx_inv[i][j] * xty[j];
+            }
+        }
+
+        // Compute initial mu
+        let mut mu_g: Vec<f64> = (0..n_samples)
+            .map(|j| {
+                let eta: f64 = (0..p).map(|k| design_matrix[(j, k)] * beta[k]).sum();
+                (size_factors[j] * eta.exp()).max(minmu)
+            })
+            .collect();
+
+        // IRLS
+        let mut dev_old = 0.0;
+        for t in 0..maxit {
+            let w: Vec<f64> = mu_g.iter().map(|&m| m / (1.0 + alpha * m)).collect();
+            let z: Vec<f64> = (0..n_samples)
+                .map(|j| (mu_g[j] / size_factors[j]).ln() + (counts[(gene, j)] - mu_g[j]) / mu_g[j])
+                .collect();
+
+            // Solve (X'WX + L) beta = X'Wz
+            let mut xtwx = vec![vec![0.0; p]; p];
+            let mut xtwz = vec![0.0; p];
+            for a in 0..p {
+                for b in 0..p {
+                    for j in 0..n_samples {
+                        xtwx[a][b] += design_matrix[(j, a)] * w[j] * design_matrix[(j, b)];
+                    }
+                }
+                xtwx[a][a] += lambda;
+                for j in 0..n_samples {
+                    xtwz[a] += design_matrix[(j, a)] * w[j] * z[j];
+                }
+            }
+
+            let xtwx_inv = matrix_inverse(&xtwx);
+            let mut new_beta = vec![0.0; p];
+            for i in 0..p {
+                for j in 0..p {
+                    new_beta[i] += xtwx_inv[i][j] * xtwz[j];
+                }
+            }
+
+            if new_beta.iter().any(|&b| b.abs() > large) { break; }
+            beta = new_beta;
+
+            mu_g = (0..n_samples)
+                .map(|j| {
+                    let eta: f64 = (0..p).map(|k| design_matrix[(j, k)] * beta[k]).sum();
+                    (size_factors[j] * eta.exp()).max(minmu)
+                })
+                .collect();
+
+            let dev: f64 = -2.0 * (0..n_samples)
+                .map(|j| {
+                    let size = 1.0 / alpha;
+                    let y = counts[(gene, j)];
+                    ln_gamma(y + size) - ln_gamma(size) - ln_gamma(y + 1.0)
+                        + y * (mu_g[j] / (mu_g[j] + size)).ln()
+                        + size * (size / (mu_g[j] + size)).ln()
+                })
+                .sum::<f64>();
+
+            let conv = (dev - dev_old).abs() / (dev.abs() + 0.1);
+            if conv.is_nan() { break; }
+            if t > 0 && conv < tol { break; }
+            dev_old = dev;
+        }
+
+        for j in 0..n_samples {
+            mu[(gene, j)] = mu_g[j];
+        }
+    }
+
+    mu
+}
+
 /// Estimate gene-wise dispersions via maximum likelihood with Armijo line search.
 ///
-/// This function:
-/// 1. Normalizes counts by size factors
-/// 2. Computes initial mu via linear model (QR projection)
-/// 3. Computes rough method-of-moments dispersion estimates
-/// 4. Refines each gene's dispersion via `fit_dispersion` (parallelized with rayon)
-///
-/// # Arguments
-/// * `counts` - genes x samples count matrix
-/// * `size_factors` - per-sample size factors
-/// * `design_matrix` - samples x p design matrix
-///
-/// # Returns
-/// Tuple of (gene dispersions as Vec<f64>, mu matrix as Mat<f64>)
+/// Matches R's estimateDispersionsGeneEst:
+/// 1. Filter all-zero genes (they get NaN dispersion)
+/// 2. Normalize counts, compute mu via linear model, scale to raw
+/// 3. Combine rough + moments dispersion estimates as starting values
+/// 4. Per-gene line search optimization with convergence check (parallel via rayon)
 pub fn estimate_dispersions_gene(
     counts: &Mat<f64>,
     size_factors: &[f64],
@@ -622,41 +820,68 @@ pub fn estimate_dispersions_gene(
     let n_genes = counts.nrows();
     let n_samples = counts.ncols();
 
+    // Identify all-zero genes
+    let all_zero: Vec<bool> = (0..n_genes)
+        .map(|i| (0..n_samples).all(|j| counts[(i, j)] == 0.0))
+        .collect();
+
     // Step 1: Normalize counts
     let normalized = Mat::from_fn(n_genes, n_samples, |i, j| {
         counts[(i, j)] / size_factors[j]
     });
 
-    // Step 2: Compute mu via linear model
-    let mu = linear_model_mu(&normalized, design_matrix);
+    // Step 2: Compute mu on normalized scale, then scale to raw counts
+    let mu_normalized = linear_model_mu(&normalized, design_matrix);
+    let mu = Mat::from_fn(n_genes, n_samples, |i, j| {
+        (mu_normalized[(i, j)] * size_factors[j]).max(0.5)
+    });
 
-    // Step 3: Rough dispersion estimate (method of moments)
+    // Step 3: Starting dispersion = min(rough, moments), clamped
     let n_params = design_matrix.ncols();
-    let rough_disps = rough_disp_estimate(&normalized, &mu, n_params);
+    let rough_disps = rough_disp_estimate(&normalized, &mu_normalized, n_params);
+    let moments_disps = moments_disp_estimate(&normalized, size_factors);
 
-    // Step 4: Refine each gene's dispersion via line search (parallel)
+    let min_disp = 1e-8;
+    let max_disp = 10.0f64.max(n_samples as f64);
+
+    // Step 4: Per-gene optimization (parallel), with convergence check
     let dispersions: Vec<f64> = (0..n_genes)
         .into_par_iter()
         .map(|gene| {
-            let y: Vec<f64> = (0..n_samples).map(|j| normalized[(gene, j)]).collect();
+            if all_zero[gene] {
+                return f64::NAN;
+            }
+
+            let y: Vec<f64> = (0..n_samples).map(|j| counts[(gene, j)]).collect();
             let mu_row: Vec<f64> = (0..n_samples).map(|j| mu[(gene, j)]).collect();
-            let log_alpha_init = if rough_disps[gene] > 0.0 {
-                rough_disps[gene].ln()
-            } else {
-                // Default initial value for zero/small dispersions
-                -1.0
-            };
+
+            let alpha_init = rough_disps[gene]
+                .min(moments_disps[gene])
+                .clamp(min_disp, max_disp);
+            let log_alpha_init = alpha_init.ln();
+
+            // Compute initial log-posterior for convergence check
+            let initial_lp = log_posterior(
+                log_alpha_init, &y, &mu_row, design_matrix, log_alpha_init, 1.0, false, true,
+            );
+
             let result = fit_dispersion(
                 &y,
                 &mu_row,
                 design_matrix,
                 log_alpha_init,
-                0.0, // prior_mean (no prior for gene-wise MLE)
-                1.0, // prior_var (not used when use_prior=false)
+                log_alpha_init,
+                1.0,
                 false,
-                true, // use Cox-Reid adjustment
+                true,
             );
-            result.log_alpha.exp()
+
+            // R's convergence check: revert if log-posterior didn't increase
+            if result.final_log_posterior < initial_lp + initial_lp.abs() * 1e-6 {
+                return alpha_init;
+            }
+
+            result.log_alpha.exp().clamp(min_disp, max_disp)
         })
         .collect();
 

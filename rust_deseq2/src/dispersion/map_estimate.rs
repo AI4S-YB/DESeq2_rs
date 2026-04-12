@@ -42,6 +42,10 @@ pub fn estimate_dispersions_map(
     (0..n_genes)
         .into_par_iter()
         .map(|i| {
+            // Skip genes with NaN gene-wise dispersion (all-zero genes)
+            if gene_dispersions[i].is_nan() || trend_values[i].is_nan() || !trend_values[i].is_finite() {
+                return f64::NAN;
+            }
             let y: Vec<f64> = (0..n_samples).map(|j| counts[(i, j)]).collect();
             let mu_row: Vec<f64> = (0..n_samples).map(|j| mu[(i, j)]).collect();
             let log_alpha_init = gene_dispersions[i].max(min_disp).ln();

@@ -4,3 +4,4 @@
 .omx/
 .tmp_r_lib/
 DESeq2/
+rust_deseq2/target/

@@ -30,6 +30,10 @@ struct Cli {
     #[arg(long, default_value = "results.tsv")]
     output: PathBuf,
 
+    /// Output path for DESeq2-style size-factor normalized counts TSV
+    #[arg(long)]
+    normalized_counts_output: Option<PathBuf>,
+
     /// Significance threshold for independent filtering
     #[arg(long, default_value = "0.1")]
     alpha: f64,
@@ -54,9 +58,8 @@ fn main() {
     }
 
     eprintln!("Loading data...");
-    let mut dds =
-        DESeqDataSet::from_csv(&cli.counts, &cli.coldata, &cli.design, &cli.reference)
-            .expect("Failed to load data");
+    let mut dds = DESeqDataSet::from_csv(&cli.counts, &cli.coldata, &cli.design, &cli.reference)
+        .expect("Failed to load data");
     eprintln!(
         "Loaded {} genes x {} samples",
         dds.gene_names.len(),
@@ -71,6 +74,12 @@ fn main() {
         dds.export_intermediates(dir).expect("Failed to export");
     }
 
+    if let Some(ref path) = cli.normalized_counts_output {
+        eprintln!("Writing normalized counts to {:?}", path);
+        dds.write_normalized_counts(path)
+            .expect("Failed to write normalized counts");
+    }
+
     eprintln!("Extracting results...");
     let results = dds
         .results(Contrast::LastCoefficient)
@@ -83,8 +92,5 @@ fn main() {
         .iter()
         .filter(|r| !r.p_adjusted.is_nan() && r.p_adjusted < 0.01 && r.log2_fold_change.abs() > 1.0)
         .count();
-    eprintln!(
-        "Done. Significant genes (padj<0.01, |log2FC|>1): {}",
-        n_sig
-    );
+    eprintln!("Done. Significant genes (padj<0.01, |log2FC|>1): {}", n_sig);
 }

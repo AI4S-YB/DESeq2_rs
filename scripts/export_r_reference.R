@@ -39,6 +39,10 @@ write.table(data.frame(sample = names(sf), size_factor = sf),
             sep = "\t", quote = FALSE, row.names = FALSE)
 
 # Export base means (after size factor normalization)
+normalized_counts <- counts(dds, normalized = TRUE)
+write.table(normalized_counts, file.path(outdir, "r_normalized_counts.tsv"),
+            sep = "\t", quote = FALSE, col.names = NA)
+
 base_means <- rowMeans(counts(dds, normalized = TRUE))
 write.table(data.frame(gene = names(base_means), baseMean = base_means),
             file.path(outdir, "r_base_means.tsv"),

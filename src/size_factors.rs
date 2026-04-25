@@ -42,17 +42,32 @@ pub fn base_means(counts: &Mat<f64>, size_factors: &[f64]) -> Vec<f64> {
     let n_samples = counts.ncols();
     (0..n_genes)
         .map(|i| {
-            let sum: f64 = (0..n_samples).map(|j| counts[(i, j)] / size_factors[j]).sum();
+            let sum: f64 = (0..n_samples)
+                .map(|j| counts[(i, j)] / size_factors[j])
+                .sum();
             sum / n_samples as f64
         })
         .collect()
 }
 
+/// Compute size-factor normalized counts (`counts(dds, normalized=TRUE)` in DESeq2).
+pub fn normalized_counts(counts: &Mat<f64>, size_factors: &[f64]) -> Mat<f64> {
+    let n_genes = counts.nrows();
+    let n_samples = counts.ncols();
+    assert_eq!(
+        size_factors.len(),
+        n_samples,
+        "size_factors length must match count matrix columns"
+    );
+
+    Mat::from_fn(n_genes, n_samples, |i, j| counts[(i, j)] / size_factors[j])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faer::Mat;
     use approx::assert_relative_eq;
+    use faer::Mat;
 
     #[test]
     fn test_size_factors_simple() {
@@ -78,12 +93,21 @@ mod tests {
 
     #[test]
     fn test_base_means() {
-        let counts = Mat::from_fn(2, 2, |i, j| {
-            [[10.0, 20.0], [30.0, 60.0]][i][j]
-        });
+        let counts = Mat::from_fn(2, 2, |i, j| [[10.0, 20.0], [30.0, 60.0]][i][j]);
         let sf = vec![1.0, 2.0];
         let bm = base_means(&counts, &sf);
         assert_relative_eq!(bm[0], 10.0, epsilon = 1e-10); // (10/1 + 20/2) / 2 = 10
         assert_relative_eq!(bm[1], 30.0, epsilon = 1e-10); // (30/1 + 60/2) / 2 = 30
+    }
+
+    #[test]
+    fn test_normalized_counts() {
+        let counts = Mat::from_fn(2, 2, |i, j| [[10.0, 20.0], [30.0, 60.0]][i][j]);
+        let sf = vec![1.0, 2.0];
+        let normalized = normalized_counts(&counts, &sf);
+        assert_relative_eq!(normalized[(0, 0)], 10.0, epsilon = 1e-10);
+        assert_relative_eq!(normalized[(0, 1)], 10.0, epsilon = 1e-10);
+        assert_relative_eq!(normalized[(1, 0)], 30.0, epsilon = 1e-10);
+        assert_relative_eq!(normalized[(1, 1)], 30.0, epsilon = 1e-10);
     }
 }

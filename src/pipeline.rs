@@ -57,8 +57,7 @@ impl DESeqDataSet {
             }
             let n_genes = counts.nrows();
             let n_samples = col_order.len();
-            let reordered =
-                Mat::from_fn(n_genes, n_samples, |i, j| counts[(i, col_order[j])]);
+            let reordered = Mat::from_fn(n_genes, n_samples, |i, j| counts[(i, col_order[j])]);
             (reordered, coldata_sample_names)
         };
 
@@ -214,6 +213,27 @@ impl DESeqDataSet {
             .collect();
 
         Ok(results)
+    }
+
+    /// Return size-factor normalized counts (`counts(dds, normalized=TRUE)` in DESeq2).
+    pub fn normalized_counts(&self) -> Result<Mat<f64>, String> {
+        let size_factors = self
+            .size_factors
+            .as_ref()
+            .ok_or("pipeline has not been run yet")?;
+        Ok(size_factors::normalized_counts(&self.counts, size_factors))
+    }
+
+    /// Write size-factor normalized counts to a TSV file.
+    pub fn write_normalized_counts(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+        let normalized = self.normalized_counts().map_err(std::io::Error::other)?;
+        io::write_named_matrix(
+            path,
+            &normalized,
+            &self.gene_names,
+            &self.sample_names,
+            "gene",
+        )
     }
 
     /// Export intermediate results (size factors, dispersions, etc.) to a directory.
